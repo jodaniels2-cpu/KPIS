@@ -6,7 +6,7 @@ import streamlit as st
 import plotly.graph_objects as go
 from datetime import datetime, date, timedelta
 
-st.set_page_config(page_title="Modality Lewisham — KPI Dashboard (v9d2: robust pickers)", page_icon="🏥", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Modality Lewisham — KPI Dashboard (v9d3: per‑day drilldowns)", page_icon="🏥", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown(
     """
@@ -28,7 +28,7 @@ st.markdown(
   <span class=\"ml-pill\">Modality Lewisham</span>
   <div>
     <p class=\"ml-title\">A‑Team KPI Dashboard</p>
-    <p class=\"ml-sub\">Three independent sections with their own staff pickers: Klinik • Docman • Calls</p>
+    <p class=\"ml-sub\">Three independent sections with per‑day drilldowns: Klinik • Docman • Calls</p>
   </div>
 </div>
 """, unsafe_allow_html=True,
@@ -109,6 +109,49 @@ def normalise_name_or_email(x):
     s = str(x).strip()
     return s.lower() if "@" in s else s
 
+def hour_list_from(data, clamp):
+    if data.empty:
+        return []
+    if clamp:
+        return list(range(8,19))
+    hours = sorted(data["when"].dt.hour.dropna().unique().tolist())
+    if not hours:
+        hours = list(range(0,24))
+    return hours
+
+def render_day_hour_table(df_in, value_label, clamp, extra_group=None):
+    if df_in.empty:
+        return pd.DataFrame(columns=["Hour", value_label] if value_label else ["Hour","Group","Callback","Total"])
+    tmp = df_in.copy()
+    tmp["hour"] = tmp["when"].dt.hour
+    idx_hours = hour_list_from(tmp, clamp)
+    if not idx_hours:
+        idx_hours = list(range(8,19)) if clamp else list(range(0,24))
+    if extra_group is None:
+        p = tmp.groupby("hour").size().reindex(idx_hours, fill_value=0).reset_index()
+        p.columns = ["Hour", value_label]
+    else:
+        p = (tmp.groupby(["hour", extra_group]).size()
+               .unstack(fill_value=0).reindex(index=idx_hours, fill_value=0).reset_index())
+        for col in ["Group","Callback"]:
+            if col not in p.columns: p[col] = 0
+        p["Total"] = p.get("Group",0) + p.get("Callback",0)
+        p.rename(columns={"hour":"Hour"}, inplace=True)
+        return p.assign(Hour=p["Hour"].apply(lambda h: f"{int(h):02d}:00"))
+    p["Hour"] = p["Hour"].apply(lambda h: f"{int(h):02d}:00")
+    return p
+
+def render_week_table(df_in, label):
+    if df_in.empty:
+        return pd.DataFrame(columns=["Date", label])
+    tmp = df_in.copy()
+    tmp["date_only"] = tmp["when"].dt.date
+    w = (tmp.groupby("date_only").size().reset_index(name=label)
+            .assign(Date=lambda d: pd.to_datetime(d["date_only"]).dt.strftime("%a %d %b"))
+            .drop(columns=["date_only"]))
+    total = pd.DataFrame([{"Date":"Total", label:int(w[label].sum())}])
+    return pd.concat([w, total], ignore_index=True)
+
 with st.sidebar:
     st.header("Global filters")
     today=date.today()
@@ -159,7 +202,7 @@ call_start_col         = find_col(call_df.columns, ["Start Time","Start","StartD
 if any(v is None for v in [call_user_answered_col, call_caller_col, call_type_col, call_start_col]):
     st.error("Calls file: couldn't auto-detect required columns."); st.stop()
 
-# Build datasets
+# Datasets
 start_dt = datetime.combine(start, datetime.min.time())
 end_dt = datetime.combine(end, datetime.max.time())
 
@@ -201,7 +244,6 @@ calls_all = pd.DataFrame({
     "outcome": call_df[call_outcome_col].astype(str).str.lower() if call_outcome_col else ""
 }).dropna(subset=["when","person"])
 calls_all = calls_all[(calls_all["when"]>=pd.Timestamp(start_dt)) & (calls_all["when"]<=pd.Timestamp(end_dt))]
-
 calls = calls_all.copy()
 if only_answered and call_outcome_col is not None:
     answered_mask = calls["outcome"].str.contains("answer|answered|connect|connected|complete|completed|handled|finished|resolved|success|ok", na=False)
@@ -218,20 +260,26 @@ if not k_users:
 else:
     k_user = st.selectbox("Klinik staff member", k_users, key="klin_picker")
     kdf = klinik[klinik["person"]==k_user].copy()
-    if kdf.empty:
-        st.warning("No Klinik cases for this person with current filters. Try unticking **Limit to 08:00–18:30**.")
+    kdf_all = klinik_all[klinik_all["person"]==k_user].copy()
+    if kdf_all.empty:
+        st.warning("No Klinik cases for this person in the selected date range.")
     else:
-        kdf["hour"] = kdf["when"].dt.hour
-        hours = list(range(8,19)) if clamp else sorted(kdf["hour"].unique().tolist())
-        if not hours: hours = list(range(0,24))
-        k_pivot = kdf.groupby("hour").size().reindex(hours, fill_value=0).reset_index()
-        k_pivot.columns = ["Hour","Klinik Cases"]
-        k_pivot["Hour"] = k_pivot["Hour"].apply(lambda h: f"{h:02d}:00")
-        st.dataframe(k_pivot, use_container_width=True, height=260)
-        with st.expander("Units closed in (top)", expanded=False):
-            unit_tbl = kdf["unit"].value_counts().head(12).reset_index()
-            unit_tbl.columns = ["Unit","Cases"]
-            st.dataframe(unit_tbl, use_container_width=True)
+        st.caption("Week summary — per day")
+        st.dataframe(render_week_table(kdf_all, "Klinik Cases"), use_container_width=True, height=200)
+        valid_days = sorted(kdf_all["when"].dt.date.unique().tolist())
+        day_label_map = {d: pd.Timestamp(d).strftime("%A %d %B") for d in valid_days}
+        pick = st.selectbox("Choose day", [day_label_map[d] for d in valid_days], key="klin_day")
+        day_dt = [d for d,l in day_label_map.items() if l==pick][0]
+        day_rows = kdf[kdf["when"].dt.date==day_dt]
+        if day_rows.empty:
+            st.warning("No Klinik rows for this person on that day with current filters. Try unticking **Limit to 08:00–18:30**.")
+        else:
+            k_hour = render_day_hour_table(day_rows, "Klinik Cases", clamp)
+            st.dataframe(k_hour, use_container_width=True, height=260)
+            with st.expander("Units closed in (this day)", expanded=False):
+                unit_tbl = (day_rows["unit"].value_counts().reset_index())
+                unit_tbl.columns = ["Unit","Cases"]
+                st.dataframe(unit_tbl, use_container_width=True)
 
 st.markdown("---")
 
@@ -242,16 +290,22 @@ if not d_users:
 else:
     d_user = st.selectbox("Docman staff member", d_users, key="doc_picker")
     ddf = docman[docman["person"]==d_user].copy()
-    if ddf.empty:
-        st.warning("No Docman tasks for this person with current filters. Try unticking **Limit to 08:00–18:30**.")
+    ddf_all = docman_all[docman_all["person"]==d_user].copy()
+    if ddf_all.empty:
+        st.warning("No Docman tasks for this person in the selected date range.")
     else:
-        ddf["hour"] = ddf["when"].dt.hour
-        hours = list(range(8,19)) if clamp else sorted(ddf["hour"].unique().tolist())
-        if not hours: hours = list(range(0,24))
-        d_pivot = ddf.groupby("hour").size().reindex(hours, fill_value=0).reset_index()
-        d_pivot.columns = ["Hour","Docman Completed"]
-        d_pivot["Hour"] = d_pivot["Hour"].apply(lambda h: f"{h:02d}:00")
-        st.dataframe(d_pivot, use_container_width=True, height=260)
+        st.caption("Week summary — per day")
+        st.dataframe(render_week_table(ddf_all, "Docman Completed"), use_container_width=True, height=200)
+        valid_days = sorted(ddf_all["when"].dt.date.unique().tolist())
+        day_label_map = {d: pd.Timestamp(d).strftime("%A %d %B") for d in valid_days}
+        pick = st.selectbox("Choose day", [day_label_map[d] for d in valid_days], key="doc_day")
+        day_dt = [d for d,l in day_label_map.items() if l==pick][0]
+        day_rows = ddf[ddf["when"].dt.date==day_dt]
+        if day_rows.empty:
+            st.warning("No Docman rows for this person on that day with current filters. Try unticking **Limit to 08:00–18:30**.")
+        else:
+            d_hour = render_day_hour_table(day_rows, "Docman Completed", clamp)
+            st.dataframe(d_hour, use_container_width=True, height=260)
 
 st.markdown("---")
 
@@ -262,25 +316,38 @@ if not c_users:
 else:
     c_user = st.selectbox("Calls staff member", c_users, key="call_picker", help="For callbacks, 'person' is the caller name; for inbound, it's the 'User Name'.")
     cdf = calls[calls["person"]==c_user].copy()
-    if cdf.empty:
-        if only_answered:
-            st.warning("No calls for this person with current filters. Try unticking **Calls: only include answered/connected** or **Limit to 08:00–18:30**.")
-        else:
-            st.warning("No calls for this person with current filters. Try unticking **Limit to 08:00–18:30**.")
+    cdf_all = calls_all[calls_all["person"]==c_user].copy()
+    if cdf_all.empty:
+        st.warning("No calls for this person in the selected date range.")
     else:
-        cdf["hour"] = cdf["when"].dt.hour
-        hours = list(range(8,19)) if clamp else sorted(cdf["hour"].unique().tolist())
-        if not hours: hours = list(range(0,24))
-        c_pivot = (cdf.groupby(["hour","kind"]).size()
-                     .unstack(fill_value=0).reindex(index=hours, fill_value=0).reset_index())
-        if "Callback" not in c_pivot.columns: c_pivot["Callback"]=0
-        if "Group" not in c_pivot.columns: c_pivot["Group"]=0
-        c_pivot["Total"] = c_pivot["Callback"] + c_pivot["Group"]
-        c_pivot.rename(columns={"hour":"Hour"}, inplace=True)
-        c_pivot["Hour"] = c_pivot["Hour"].apply(lambda h: f"{h:02d}:00")
-        st.dataframe(c_pivot[["Hour","Group","Callback","Total"]], use_container_width=True, height=260)
-        fig = go.Figure()
-        fig.add_bar(x=c_pivot["Hour"], y=c_pivot["Group"], name="Group")
-        fig.add_bar(x=c_pivot["Hour"], y=c_pivot["Callback"], name="Callback")
-        fig.update_layout(barmode="stack", title="Calls by hour")
-        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Week summary — per day")
+        day_counts = (cdf_all.assign(label=lambda d: np.where(d["kind"]=="Callback","Callback","Group"))
+                      .groupby([cdf_all["when"].dt.date,"label"]).size()
+                      .unstack(fill_value=0).reset_index()
+                      .rename(columns={"when":"Date"}))
+        if "Group" not in day_counts.columns: day_counts["Group"]=0
+        if "Callback" not in day_counts.columns: day_counts["Callback"]=0
+        day_counts["Calls Total"] = day_counts["Group"] + day_counts["Callback"]
+        day_counts["Date"] = pd.to_datetime(day_counts["Date"]).dt.strftime("%a %d %b")
+        total_row = pd.DataFrame([{"Date":"Total","Group":int(day_counts["Group"].sum()),
+                                   "Callback":int(day_counts["Callback"].sum()), "Calls Total":int(day_counts["Calls Total"].sum())}])
+        st.dataframe(pd.concat([day_counts[["Date","Group","Callback","Calls Total"]], total_row], ignore_index=True),
+                     use_container_width=True, height=240)
+        valid_days = sorted(cdf_all["when"].dt.date.unique().tolist())
+        day_label_map = {d: pd.Timestamp(d).strftime("%A %d %B") for d in valid_days}
+        pick = st.selectbox("Choose day", [day_label_map[d] for d in valid_days], key="call_day")
+        day_dt = [d for d,l in day_label_map.items() if l==pick][0]
+        day_rows = cdf[cdf["when"].dt.date==day_dt]
+        if day_rows.empty:
+            if only_answered:
+                st.warning("No calls on that day with current filters. Try unticking **Calls: only include answered/connected** or **Limit to 08:00–18:30**.")
+            else:
+                st.warning("No calls on that day with current filters. Try unticking **Limit to 08:00–18:30**.")
+        else:
+            c_hour = render_day_hour_table(day_rows, None, clamp, extra_group="kind")
+            st.dataframe(c_hour[["Hour","Group","Callback","Total"]], use_container_width=True, height=260)
+            fig = go.Figure()
+            fig.add_bar(x=c_hour["Hour"], y=c_hour["Group"], name="Group")
+            fig.add_bar(x=c_hour["Hour"], y=c_hour["Callback"], name="Callback")
+            fig.update_layout(barmode="stack", title="Calls by hour (selected day)")
+            st.plotly_chart(fig, use_container_width=True)
